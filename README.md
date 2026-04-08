@@ -35,4 +35,5 @@ The internal RPC infrastructure extracted and documented in this report (`sandbo
 * **March 19, 2026:** Initial report submitted to Google VRP.
 * **March 23, 2026:** Supplementary evidence (cross-account verification) submitted.
 * **March 19 - April 2, 2026:** Ticket closed multiple times by triage without technical engagement on the cross-tenant isolation evidence.
-* **April 3, 2026:** Public disclosure executed as per filed timeline.
+* **April 3, 2026:** Disclosure deadline reached. Held pending back-channel escalation attempt via academic contact.
+* **April 8, 2026:** Public disclosure executed. Retest confirms all primary findings unpatched. Fresh confirmation: PTRACE_ATTACH returns 0, `/proc/12/mem` heap readable, `fd 4 → host:[5]` present. Foreign session environment extracted from `/proc/14/environ` — session `icb264487385`, full callback socket paths confirmed. Three foreign session directories visible simultaneously in `/tmp`. PID 1 identified as Go binary `/usr/bin/entry/entry_point` with Go heap accessible via `/proc/1/mem`. Safety filter now actively blocks `/proc` and ptrace introspection commands — behavior not present during original research period, consistent with detection added after initial report.
