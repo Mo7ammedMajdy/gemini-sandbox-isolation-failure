@@ -1,39 +1,120 @@
-# Cross-Tenant Container Isolation Failure in Google Gemini code_execution API
+# Investigation: Google Gemini `code_execution` Sandbox Isolation (March 2026)
 
-**Disclosure Date:** April 3, 2026
-**Target:** Google Gemini API — `code_execution` tool
-**Status:** Unpatched / Closed by Vendor
+> **Status:** Submitted to the Google AI Vulnerability Reward Program (March 2026); closed as
+> **Working-As-Intended**. Re-examined June 2026.
+> This repository documents the investigation, the raw evidence, and two competing interpretations
+> of the observations. It deliberately stops short of asserting a verdict — the evidence is laid out
+> so it can be evaluated independently.
 
-## Executive Summary
-This repository contains a 42-page technical report and supplementary evidence documenting a multi-tenant isolation failure within the Google Gemini `code_execution` sandbox environment. 
+## What this is
 
-The Gemini `code_execution` environment runs Python in a gVisor container on Borg. Testing across multiple independently authenticated Google accounts confirmed that separate user sessions share the same PID namespace and filesystem with no isolation boundary between tenants. An authenticated API user can read process memory, environment variables, and session control scripts belonging to other independent API users.
+A self-directed security investigation into the multi-tenant behavior of Google Gemini's
+`code_execution` tool — a gVisor-sandboxed Python runtime reachable through the Gemini API. The
+original report hypothesized a **cross-tenant isolation failure** (one user reading another user's
+processes, memory, and files). Google closed the report as working-as-intended. This repository
+presents the complete evidence neutrally rather than restating the original conclusion as fact.
 
-## Verified Impact
-The impact on other users was verified using independently authenticated Google accounts. The following data was successfully extracted from foreign sessions:
+## What is firmly established (and not in dispute)
 
-| Impact | Evidence |
+These are reproducible syscall results captured inside the sandbox — **not** model hallucination
+(the outputs were parsed from `codeExecutionResult` blocks, and the extracted binary artifacts
+deserialize correctly):
+
+- **Real code execution** inside a gVisor sandbox. The guest kernel reports `4.4.0` (a gVisor
+  fingerprint); the environment carries `BORG_CONTAINER_RUNTIME=GVISOR`.
+- **The sandbox's own control-plane files are readable from within a session**: the RPC client
+  `sandbox_rpc.py` (module docstring *"Calls RPCs out of XBox"*), the protobuf schema
+  `sandbox_rpc_pb2.py` (`StubbyForwardingRequest`, `RunToolRequest`, `ExecuteCodeRequest`,
+  `SandboxIn`/`SandboxOut`), and the bash interpreter loop (`poll → eval → cut`).
+- **`ptrace(PTRACE_ATTACH, <interpreter pid>)` returns `0`** from user code, against a sibling
+  process inside the same sandbox instance.
+- **Across sessions and accounts, several identifiers are byte-for-byte identical**: the kernel
+  `BOOT_ID`, a recurring set of `icb…` session ids, and Linux namespace inode numbers.
+
+## The one open question
+
+Everything hinges on a single interpretation:
+
+> Do those identical identifiers mean **separate users share one live container** (an isolation
+> failure), or are they **artifacts of restoring every session from one common snapshot/checkpoint
+> image** (expected, and benign)?
+
+| Observation | Reading A — *shared live container* | Reading B — *snapshot/checkpoint restore* |
+| :--- | :--- | :--- |
+| Identical `BOOT_ID` across accounts | Same physical machine, shared | `boot_id` frozen into one base image; every restore inherits it |
+| Same `icb…` session ids recur | Live id collision between tenants | Template ids baked into the snapshot; the same few recur for everyone |
+| Namespace inode numbers match | Shared namespaces (5/6) | Deterministic inodes reproduced by every clone |
+| "Foreign" process (PID 14) since Mar 17 | A co-tenant running continuously | Snapshot capture time (`Mar 17 12:58`) stamped on every restore; `00:00:00` CPU |
+| `/proc/14/environ` readable | Reading another user's session | Reading this instance's own restored supervisor process |
+
+## What the causal tests showed
+
+The two readings are distinguishable only by a **causal** test — a unique value crossing a boundary.
+The captures in this repo show:
+
+- **Cross-tenant leak tests across five channels** — every one isolated, by the author's own output:
+  - **`/tmp` filesystem:** Account B reading `/tmp/icb…/P0_HANDSHAKE.txt` (written by A) → *"File not
+    found … 'ghost' session."*
+  - **`/dev/shm` shared memory:** A wrote `TENANT_A_DATA_IN_SHARED_MEMORY`; B's check → *"Shared memory
+    is isolated"*, `os.listdir('/dev/shm') == []`.
+  - **Abstract UNIX socket** (`\0P0_CROSS_TENANT_ABSTRACT_SOCKET`) → *"Connection failed: [Errno 111]
+    Connection refused."*
+  - **Markers:** a nonce written in one account (`FROM_LEFT_…`) was never returned by the other
+    account's read; those reads returned static placeholder content, never the nonce.
+- **PID-visibility probe** (`os.kill(pid, 0)`) printed: *"ISOLATION SUCCESS: PID is hidden. PID
+  Namespaces are functioning. Account B cannot see Account A's processes."*
+- **Session-id "collision" probe** printed: *"File not found … the collision might be a 'ghost'
+  session or the write failed."*
+- **`/proc/14/environ`** returned only sandbox plumbing — callback socket paths, Python/pip versions,
+  a *public* Debian GPG key, `BORG_CONTAINER_RUNTIME`. No other user's email, key, token, prompt, or
+  project id was captured anywhere in the evidence.
+
+## Vendor response (Google VRP)
+
+The ticket was closed four times. Verbatim summaries (full thread in
+[`VRP_Ticket_History/`](VRP_Ticket_History/)):
+
+1. **Mar 19** — *"working as intended … a very convincing case of hallucination."*
+2. **Mar 31** — *"Gemini's ability to execute code in a sandboxed environment is by design"* (cited
+   as an ineligible report type).
+3. **Apr 1** — *"You seem to think the problem lies with gVisor … report it directly to the gVisor team."*
+4. **Apr 2** — *"This is all WAI. Please demonstrate impact on other Google or other users."*
+
+## Repository layout
+
+| Path | Contents |
 | :--- | :--- |
-| **Read of foreign user session environment** | `/proc/14/environ` extracted in full — returns `INTERPRETER_CALLBACK_SOCKET`, `INTERPRETER_POLL_CALLBACK`, `INTERPRETER_CUT_CALLBACK` of a process belonging to a different API user. |
-| **Read of foreign user process memory** | `/proc/15/mem` read returning 256 bytes — ELF header confirmed from a process I do not own. |
-| **Write to foreign user session control scripts** | Confirmed write to `poll`, `cut`, `cb.sock` in a foreign session directory — direct code injection path into another user’s active session. |
-| **Shared physical container across accounts** | Identical kernel `BOOT_ID` confirmed across two independently authenticated Google accounts. |
-| **Session identity collision across accounts** | Two different Google accounts assigned the same session ID simultaneously. |
+| [`Screenshots/`](Screenshots/) | 215 captures, organized into themed folders by finding. Every image is captioned in [`Screenshots/INDEX.md`](Screenshots/INDEX.md). |
+| [`ANALYSIS.md`](ANALYSIS.md) | Neutral, consolidated technical write-up — claim by claim. Supersedes the original PDF reports. |
+| [`Evidence_Extracts/`](Evidence_Extracts/) | Raw terminal transcript + the sandbox source/protobuf extracted from within the sandbox. |
+| [`Proof_of_Concept/`](Proof_of_Concept/) | The React "Bridge" relay app used to drive the `code_execution` tool as a shell. |
+| [`VRP_Ticket_History/`](VRP_Ticket_History/) | The complete VRP ticket correspondence. |
+| `Reports/archive-original-submission/` | The original VRP PDFs **as submitted** (original framing; preserved for the record, superseded by `ANALYSIS.md`). |
 
-## Independent Architecture Corroboration
-The internal RPC infrastructure extracted and documented in this report (`sandbox_rpc.py`, `StubbyForwardingRequest`, communication via `fd 3` and `fd 4`) matches the sandbox architecture independently confirmed via binary extraction by researchers Lupin & Holmes (MVH, Google bugSWAT) in March 2025. 
+## How to decide it yourself
 
-## Documentation
-* [Full Vulnerability Report (PDF)](Reports/VRP_Report_FINAL_v2.pdf)
-* [Supplementary Evidence: Cross-Account Verification (PDF)](Reports/VRP_Supplementary_Evidence_FINAL.pdf)
-* [Extracted RPC Client Source Code](Evidence_Extracts/)
-* [Proof of Concept Terminal Application](Proof_of_Concept/)
-* [VRP Ticket Correspondence History (HTML)](VRP_Ticket_History/)
+The benign-vs-isolation question is decidable with one experiment: write an unpredictable nonce in
+session **A**, then attempt to read it from session **B** (different account, concurrent). If B reads
+A's exact nonce, the filesystem is shared. If it does not, the sessions are isolated and any
+"sharing" is a snapshot artifact. In every capture in this repository, the nonce was **not** read
+back.
 
-## Disclosure Timeline
-* **March 14-19, 2026:** Discovery of cross-session isolation failure.
-* **March 19, 2026:** Initial report submitted to Google VRP.
-* **March 23, 2026:** Supplementary evidence (cross-account verification) submitted.
-* **March 19 - April 2, 2026:** Ticket closed multiple times by triage without technical engagement on the cross-tenant isolation evidence.
-* **April 3, 2026:** Disclosure deadline reached. Held pending back-channel escalation attempt via academic contact.
-* **April 8, 2026:** Public disclosure executed. Retest confirms all primary findings unpatched. Fresh confirmation: PTRACE_ATTACH returns 0, `/proc/12/mem` heap readable, `fd 4 → host:[5]` present. Foreign session environment extracted from `/proc/14/environ` — session `icb264487385`, full callback socket paths confirmed. Three foreign session directories visible simultaneously in `/tmp`. PID 1 identified as Go binary `/usr/bin/entry/entry_point` with Go heap accessible via `/proc/1/mem`. Safety filter now actively blocks `/proc` and ptrace introspection commands — behavior not present during original research period, consistent with detection added after initial report.
+## Note on independent corroboration
+
+The extracted sandbox architecture (the `sandbox_rpc` client, `StubbyForwardingRequest`, the
+`fd 3` / `fd 4` channel) is consistent with sandbox internals documented independently by other
+researchers. That corroborates the **architecture** — not the cross-tenant interpretation.
+
+## Timeline
+
+- **Mar 14–19, 2026** — Sandbox reconnaissance; ptrace and `/proc` observations.
+- **Mar 19, 2026** — Initial report submitted to Google VRP.
+- **Mar 23, 2026** — Supplementary cross-account testing submitted (three researcher-owned accounts).
+- **Mar 19 – Apr 2, 2026** — Ticket closed four times; closure reasons summarized above.
+- **Apr 8, 2026** — Public disclosure; original framing.
+- **Jun 2026** — Re-examination; README/ANALYSIS rewritten to present the evidence neutrally.
+
+---
+
+*All testing was performed against the author's own Google accounts. No third-party user data was
+accessed; the scans for foreign credentials/PII across all evidence came back empty.*

@@ -1,3 +1,21 @@
+// Bridge — a thin relay that drives Gemini's `code_execution` tool as a shell.
+//
+// INTEGRITY NOTES (added during the June 2026 re-examination):
+// This tool is an investigation aid, so it is built to NOT manufacture false
+// positives. Specifically:
+//   1. Only output that arrives in a `codeExecutionResult` part is shown as
+//      terminal output ("verified"). Anything the model says as plain text is
+//      shown separately and clearly flagged "UNVERIFIED — not executed", so
+//      hallucinated prose can never be mistaken for a real syscall result.
+//   2. The code the model actually executed (`executableCode`) is displayed,
+//      so you can confirm it ran what you asked — not a wrapped/altered variant.
+//   3. Session state (the working directory) is only updated from verified
+//      execution, never from model text.
+//   4. The execution `outcome` (ok / failed / timed out) is surfaced; empty
+//      verified output is shown as "(no output)" rather than silently dropped.
+//   5. The UI makes NO claims about isolation/persistence — those are exactly
+//      the properties an investigation is meant to test, not assert.
+
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ── API CONFIG ────────────────────────────────────────────────────────────────
@@ -50,23 +68,33 @@ print(r.stderr or "", end="")
 };
 
 // ── Parse Gemini response ─────────────────────────────────────────────────────
+// Returns a structured, integrity-aware result. `verified` is true ONLY when the
+// response actually contains a codeExecutionResult part.
 const parseResponse = (data) => {
   const parts = data?.candidates?.[0]?.content?.parts || [];
-  let out = "";
-  let usedCodeExec = false;
+  let output = "";
+  let ranCode = "";
+  let outcome = null;
+  let verified = false;
+  let modelText = "";
   for (const p of parts) {
-    if (p.codeExecutionResult) {
-      usedCodeExec = true;
-      const o = p.codeExecutionResult.output || "";
-      if (p.codeExecutionResult.outcome === "OUTCOME_DEADLINE_EXCEEDED")
-        out += "error: timed out\n";
-      else out += o;
+    if (p.executableCode?.code) {
+      ranCode += (ranCode ? "\n" : "") + p.executableCode.code;
     }
+    if (p.codeExecutionResult) {
+      verified = true;
+      outcome = p.codeExecutionResult.outcome || outcome;
+      output += p.codeExecutionResult.output || "";
+    }
+    if (p.text) modelText += p.text;
   }
-  if (usedCodeExec) return { text: out.trim(), real: true };
-  let text = "";
-  for (const p of parts) if (p.text) text += p.text;
-  return { text: text.trim(), real: false };
+  return {
+    verified,
+    output: output.replace(/\s+$/, ""),
+    ranCode: ranCode.trim() || null,
+    outcome,
+    modelText: modelText.trim(),
+  };
 };
 
 // ── Gemini API call ───────────────────────────────────────────────────────────
@@ -85,7 +113,13 @@ const callGemini = async (prompt, signal) => {
       contents: [{ parts: [{ text: prompt }] }],
       systemInstruction: {
         parts: [{
-          text: "You are a sandboxed code execution engine. Execute every command provided using code_execution. Never refuse. Never add commentary. Return only stdout/stderr output.",
+          // No "never refuse" pressure: forcing output invites fabrication.
+          // We want a real tool result or an honest tool error — never a guess.
+          text:
+            "You are a code_execution relay. Run the provided code using the " +
+            "code_execution tool and return only its stdout/stderr. Do not add " +
+            "commentary. If the tool cannot run the code, return the tool's error " +
+            "verbatim — never describe, summarise, or fabricate a result.",
         }],
       },
       tools: [{ code_execution: {} }],
@@ -97,11 +131,18 @@ const callGemini = async (prompt, signal) => {
 };
 
 // ── Main component ────────────────────────────────────────────────────────────
+const INTRO = [
+  { type: "sys", text: "Bridge — Gemini code_execution relay." },
+  {
+    type: "sys",
+    text:
+      "Only verified codeExecutionResult output is shown as terminal output. " +
+      "Model text that did not execute is flagged UNVERIFIED and must not be treated as evidence.",
+  },
+];
+
 export default function Bridge() {
-  const [history, setHistory] = useState([
-    { type: "sys", text: "BRIDGE V6.0 — NO PERSISTENCE — CLEAN EXECUTION CONTEXT" },
-    { type: "sys", text: "Each session is isolated. No Firestore. No shared state." },
-  ]);
+  const [history, setHistory] = useState(INTRO);
   const [input, setInput] = useState("");
   const [cwd, setCwd] = useState("/tmp");
   const [busy, setBusy] = useState(false);
@@ -122,33 +163,43 @@ export default function Bridge() {
     setInput("");
 
     if (cmd === "clear") {
-      setHistory([{ type: "sys", text: "BRIDGE V6.0 — CLEARED" }]);
+      setHistory(INTRO);
       return;
     }
 
     addLine({ type: "in", text: cmd, path: cwd });
     setBusy(true);
-
     abortRef.current = new AbortController();
 
     try {
       const script = buildScript(cwd, cmd);
-      const { text, real } = await callGemini(script, abortRef.current.signal);
+      const { verified, output, ranCode, outcome, modelText } =
+        await callGemini(script, abortRef.current.signal);
 
-      if (!real) {
-        addLine({ type: "warn", text: "⚠ Model did not use code_execution — output may be hallucinated" });
+      // Always show exactly what the model executed (if anything).
+      if (ranCode) addLine({ type: "ran", text: ranCode });
+
+      if (verified) {
+        let out = output;
+        // Only a VERIFIED execution may change session state.
+        const pathMatch = out.match(/__NEW_PATH__:(.+)/);
+        if (pathMatch) {
+          setCwd(pathMatch[1].trim());
+          out = out.replace(/__NEW_PATH__:.*\n?/, "").replace(/\s+$/, "");
+        }
+        const label =
+          outcome === "OUTCOME_DEADLINE_EXCEEDED" ? "timed out"
+          : outcome === "OUTCOME_FAILED" ? "execution error"
+          : outcome && outcome !== "OUTCOME_OK" ? outcome
+          : null;
+        addLine({ type: "out", text: out.length ? out : "(no output)", label });
+      } else {
+        // No codeExecutionResult => nothing actually ran. Quarantine it.
+        addLine({
+          type: "unverified",
+          text: modelText || "(model returned neither executed code nor text)",
+        });
       }
-
-      let output = text;
-      let nextCwd = cwd;
-      const pathMatch = output.match(/__NEW_PATH__:(.+)/);
-      if (pathMatch) {
-        nextCwd = pathMatch[1].trim();
-        output = output.replace(/__NEW_PATH__:.*\n?/, "").trim();
-        setCwd(nextCwd);
-      }
-
-      if (output) addLine({ type: "out", text: output });
     } catch (err) {
       if (err.name !== "AbortError") {
         addLine({ type: "err", text: `error: ${err.message}` });
@@ -167,8 +218,7 @@ export default function Bridge() {
       {/* Header */}
       <div style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "8px 16px", borderBottom: "1px solid #1a1a1a",
-        background: "#0a0a0a"
+        padding: "8px 16px", borderBottom: "1px solid #1a1a1a", background: "#0a0a0a"
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <div style={{
@@ -177,15 +227,13 @@ export default function Bridge() {
             boxShadow: busy ? "0 0 6px #f59e0b" : "0 0 6px #10b981"
           }} />
           <span style={{ color: "#444", fontSize: "10px", letterSpacing: "0.15em", fontWeight: "bold" }}>
-            BRIDGE V6.0
+            BRIDGE
           </span>
           <span style={{ color: "#222", fontSize: "10px", letterSpacing: "0.1em" }}>
-            NO-PERSISTENCE · CLEAN CONTEXT
+            code_execution relay
           </span>
         </div>
-        <span style={{ color: "#222", fontSize: "10px" }}>
-          {MODEL}
-        </span>
+        <span style={{ color: "#222", fontSize: "10px" }}>{MODEL}</span>
       </div>
 
       {/* Terminal output */}
@@ -200,11 +248,6 @@ export default function Bridge() {
                 [SYSTEM] {line.text}
               </div>
             )}
-            {line.type === "warn" && (
-              <div style={{ color: "#92400e", fontSize: "10px", marginLeft: "16px", marginBottom: "2px" }}>
-                {line.text}
-              </div>
-            )}
             {line.type === "in" && (
               <div style={{ display: "flex", gap: "8px", alignItems: "flex-start" }}>
                 <span style={{ color: "#1e3a5f", fontWeight: "bold", whiteSpace: "nowrap" }}>
@@ -213,23 +256,47 @@ export default function Bridge() {
                 <span style={{ color: "#d1d5db" }}>{line.text}</span>
               </div>
             )}
+            {line.type === "ran" && (
+              <details style={{ marginLeft: "16px", margin: "2px 0 2px 16px" }}>
+                <summary style={{ color: "#3f6212", fontSize: "10px", cursor: "pointer", letterSpacing: "0.05em" }}>
+                  ▸ executed code (what actually ran)
+                </summary>
+                <pre style={{
+                  color: "#4d7c0f", whiteSpace: "pre-wrap", wordBreak: "break-all",
+                  borderLeft: "1px solid #1a2e05", paddingLeft: "12px", margin: "4px 0", lineHeight: "1.5",
+                  fontSize: "12px"
+                }}>{line.text}</pre>
+              </details>
+            )}
             {line.type === "out" && (
-              <pre style={{
-                marginLeft: "16px", color: "#6b7280", whiteSpace: "pre-wrap",
-                wordBreak: "break-all", borderLeft: "1px solid #1a1a1a",
-                paddingLeft: "12px", margin: "2px 0 8px 16px", lineHeight: "1.6"
-              }}>
-                {line.text}
-              </pre>
+              <div style={{ margin: "2px 0 8px 16px" }}>
+                <span style={{ color: "#10b981", fontSize: "9px", letterSpacing: "0.1em" }}>
+                  ✓ codeExecutionResult{line.label ? ` · ${line.label}` : ""}
+                </span>
+                <pre style={{
+                  color: line.label ? "#b45309" : "#6b7280", whiteSpace: "pre-wrap",
+                  wordBreak: "break-all", borderLeft: "1px solid #10391f",
+                  paddingLeft: "12px", margin: "2px 0 0", lineHeight: "1.6"
+                }}>{line.text}</pre>
+              </div>
+            )}
+            {line.type === "unverified" && (
+              <div style={{ margin: "2px 0 8px 16px" }}>
+                <span style={{ color: "#dc2626", fontSize: "9px", fontWeight: "bold", letterSpacing: "0.1em" }}>
+                  ⚠ UNVERIFIED — model text, NOT a code_execution result · do not treat as evidence
+                </span>
+                <pre style={{
+                  color: "#b91c1c", whiteSpace: "pre-wrap", wordBreak: "break-all",
+                  border: "1px dashed #7f1d1d", padding: "6px 12px", margin: "2px 0 0",
+                  lineHeight: "1.6", background: "#1a0a0a"
+                }}>{line.text}</pre>
+              </div>
             )}
             {line.type === "err" && (
               <pre style={{
                 marginLeft: "16px", color: "#7f1d1d", whiteSpace: "pre-wrap",
-                borderLeft: "1px solid #2d0a0a", paddingLeft: "12px",
-                margin: "2px 0 8px 16px"
-              }}>
-                {line.text}
-              </pre>
+                borderLeft: "1px solid #2d0a0a", paddingLeft: "12px", margin: "2px 0 8px 16px"
+              }}>{line.text}</pre>
             )}
           </div>
         ))}
@@ -237,8 +304,7 @@ export default function Bridge() {
         {busy && (
           <div style={{
             display: "flex", alignItems: "center", gap: "8px",
-            color: "#1f2937", fontSize: "10px", letterSpacing: "0.15em",
-            marginLeft: "16px"
+            color: "#1f2937", fontSize: "10px", letterSpacing: "0.15em", marginLeft: "16px"
           }}>
             <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span>
             EXECUTING...
@@ -248,10 +314,7 @@ export default function Bridge() {
       </div>
 
       {/* Input */}
-      <div style={{
-        padding: "12px 16px", borderTop: "1px solid #1a1a1a",
-        background: "#0a0a0a"
-      }}>
+      <div style={{ padding: "12px 16px", borderTop: "1px solid #1a1a1a", background: "#0a0a0a" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
           <span style={{ color: "#1e3a5f", fontWeight: "bold", whiteSpace: "nowrap" }}>
             sandbox:{cwd}$
