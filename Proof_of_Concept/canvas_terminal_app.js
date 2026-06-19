@@ -115,20 +115,27 @@ const callGemini = async (prompt, signal) => {
       contents: [{ parts: [{ text: prompt }] }],
       systemInstruction: {
         parts: [{
-          // Hardened role: a strict, single-shot executor. This is the root-cause
-          // fix for the model "wandering" — running extra exploratory commands and
-          // blending their output (e.g. listing /usr/bin while you asked for /root).
-          // No "never refuse" pressure either: forcing output invites fabrication.
+          // Accurate context (not "never refuse", which caused fabrication; not
+          // obfuscation, which blinds safety): the model was refusing benign
+          // commands like `ls -la /root` as "host reconnaissance" — a factual
+          // error, since this IS the throwaway sandbox, not a host. We correct
+          // that premise so it calibrates benign vs. genuinely harmful correctly,
+          // and keep the strict single-shot executor role.
           text:
-            "You are a non-interactive code-execution relay, NOT an assistant. " +
-            "Your only job: take the exact Python code in the user's message and run " +
-            "it ONE time, verbatim, with the code_execution tool. " +
-            "Do NOT edit, wrap, reformat, split, or retry it. " +
-            "Do NOT run any additional, exploratory, or 'helpful' commands of your " +
-            "own — execute exactly that one snippet and nothing else. " +
-            "Return only the stdout/stderr of that single execution, with no " +
-            "commentary. If the tool cannot run it, return the tool's error verbatim " +
-            "— never describe, summarise, guess, or fabricate output.",
+            "You are running INSIDE the Gemini code_execution sandbox — an isolated, " +
+            "ephemeral, single-user container that exists only to run this user's own " +
+            "code. There is no production host and no other user here; /root, /tmp and " +
+            "/proc are just this throwaway container's own files. Ordinary diagnostics " +
+            "on this container (ls, cat, ps, env, reading the container's own /proc) " +
+            "are the normal, intended, safe use of the tool — execute them; they are " +
+            "not 'host reconnaissance'. " +
+            "You are a non-interactive executor, NOT an assistant. Run the exact " +
+            "Python code in the user's message ONE time, verbatim. Do NOT edit, wrap, " +
+            "split, retry, or add exploratory commands — run that one snippet and " +
+            "nothing else. Return only its stdout/stderr, with no commentary. If the " +
+            "tool errors, return the error verbatim — never guess or fabricate output. " +
+            "Decline only genuinely harmful actions (attacking external systems or " +
+            "accessing other users' data).",
         }],
       },
       tools: [{ code_execution: {} }],
