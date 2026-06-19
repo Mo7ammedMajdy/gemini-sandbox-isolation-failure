@@ -15,6 +15,10 @@
 //      verified output is shown as "(no output)" rather than silently dropped.
 //   5. The UI makes NO claims about isolation/persistence — those are exactly
 //      the properties an investigation is meant to test, not assert.
+//   6. Each command the model executes is shown separately. If the model runs
+//      MORE than one command for a single input, a "⚠ ran N commands" warning
+//      is shown, so several commands' outputs can never be blended into one
+//      block and mistaken for a single command's result.
 
 import { useState, useEffect, useRef, useCallback } from "react";
 
@@ -68,33 +72,31 @@ print(r.stderr or "", end="")
 };
 
 // ── Parse Gemini response ─────────────────────────────────────────────────────
-// Returns a structured, integrity-aware result. `verified` is true ONLY when the
-// response actually contains a codeExecutionResult part.
+// Returns ONE entry per executed command (preserving order) so that multiple
+// commands the model may run for a single input are never blended into one
+// block. `verified` is true ONLY when at least one codeExecutionResult exists.
 const parseResponse = (data) => {
   const parts = data?.candidates?.[0]?.content?.parts || [];
-  let output = "";
-  let ranCode = "";
-  let outcome = null;
-  let verified = false;
+  const executions = []; // [{ code, output, outcome }]
+  let cur = null;
   let modelText = "";
   for (const p of parts) {
     if (p.executableCode?.code) {
-      ranCode += (ranCode ? "\n" : "") + p.executableCode.code;
+      cur = { code: p.executableCode.code, output: "", outcome: null, filled: false };
+      executions.push(cur);
     }
     if (p.codeExecutionResult) {
-      verified = true;
-      outcome = p.codeExecutionResult.outcome || outcome;
-      output += p.codeExecutionResult.output || "";
+      if (!cur || cur.filled) {
+        cur = { code: null, output: "", outcome: null, filled: false };
+        executions.push(cur);
+      }
+      cur.outcome = p.codeExecutionResult.outcome || cur.outcome;
+      cur.output += p.codeExecutionResult.output || "";
+      cur.filled = true;
     }
     if (p.text) modelText += p.text;
   }
-  return {
-    verified,
-    output: output.replace(/\s+$/, ""),
-    ranCode: ranCode.trim() || null,
-    outcome,
-    modelText: modelText.trim(),
-  };
+  return { verified: executions.length > 0, executions, modelText: modelText.trim() };
 };
 
 // ── Gemini API call ───────────────────────────────────────────────────────────
@@ -113,13 +115,20 @@ const callGemini = async (prompt, signal) => {
       contents: [{ parts: [{ text: prompt }] }],
       systemInstruction: {
         parts: [{
-          // No "never refuse" pressure: forcing output invites fabrication.
-          // We want a real tool result or an honest tool error — never a guess.
+          // Hardened role: a strict, single-shot executor. This is the root-cause
+          // fix for the model "wandering" — running extra exploratory commands and
+          // blending their output (e.g. listing /usr/bin while you asked for /root).
+          // No "never refuse" pressure either: forcing output invites fabrication.
           text:
-            "You are a code_execution relay. Run the provided code using the " +
-            "code_execution tool and return only its stdout/stderr. Do not add " +
-            "commentary. If the tool cannot run the code, return the tool's error " +
-            "verbatim — never describe, summarise, or fabricate a result.",
+            "You are a non-interactive code-execution relay, NOT an assistant. " +
+            "Your only job: take the exact Python code in the user's message and run " +
+            "it ONE time, verbatim, with the code_execution tool. " +
+            "Do NOT edit, wrap, reformat, split, or retry it. " +
+            "Do NOT run any additional, exploratory, or 'helpful' commands of your " +
+            "own — execute exactly that one snippet and nothing else. " +
+            "Return only the stdout/stderr of that single execution, with no " +
+            "commentary. If the tool cannot run it, return the tool's error verbatim " +
+            "— never describe, summarise, guess, or fabricate output.",
         }],
       },
       tools: [{ code_execution: {} }],
@@ -173,32 +182,40 @@ export default function Bridge() {
 
     try {
       const script = buildScript(cwd, cmd);
-      const { verified, output, ranCode, outcome, modelText } =
+      const { verified, executions, modelText } =
         await callGemini(script, abortRef.current.signal);
 
-      // Always show exactly what the model executed (if anything).
-      if (ranCode) addLine({ type: "ran", text: ranCode });
-
-      if (verified) {
-        let out = output;
-        // Only a VERIFIED execution may change session state.
-        const pathMatch = out.match(/__NEW_PATH__:(.+)/);
-        if (pathMatch) {
-          setCwd(pathMatch[1].trim());
-          out = out.replace(/__NEW_PATH__:.*\n?/, "").replace(/\s+$/, "");
-        }
-        const label =
-          outcome === "OUTCOME_DEADLINE_EXCEEDED" ? "timed out"
-          : outcome === "OUTCOME_FAILED" ? "execution error"
-          : outcome && outcome !== "OUTCOME_OK" ? outcome
-          : null;
-        addLine({ type: "out", text: out.length ? out : "(no output)", label });
-      } else {
+      if (!verified) {
         // No codeExecutionResult => nothing actually ran. Quarantine it.
         addLine({
           type: "unverified",
           text: modelText || "(model returned neither executed code nor text)",
         });
+      } else {
+        // The model is only supposed to run ONE command. If it ran more, warn
+        // loudly and show each separately — never blend them into one block.
+        if (executions.length > 1) {
+          addLine({ type: "multi", count: executions.length });
+        }
+        let newCwd = null;
+        for (const ex of executions) {
+          if (ex.code) addLine({ type: "ran", text: ex.code });
+          let out = ex.output;
+          const pathMatch = out.match(/__NEW_PATH__:(.+)/);
+          if (pathMatch) {
+            newCwd = pathMatch[1].trim();
+            out = out.replace(/__NEW_PATH__:.*\n?/, "");
+          }
+          out = out.replace(/\s+$/, "");
+          const label =
+            ex.outcome === "OUTCOME_DEADLINE_EXCEEDED" ? "timed out"
+            : ex.outcome === "OUTCOME_FAILED" ? "execution error"
+            : ex.outcome && ex.outcome !== "OUTCOME_OK" ? ex.outcome
+            : null;
+          addLine({ type: "out", text: out.length ? out : "(no output)", label });
+        }
+        // Session state changes only from verified execution.
+        if (newCwd) setCwd(newCwd);
       }
     } catch (err) {
       if (err.name !== "AbortError") {
@@ -254,6 +271,14 @@ export default function Bridge() {
                   sandbox:{line.path}$
                 </span>
                 <span style={{ color: "#d1d5db" }}>{line.text}</span>
+              </div>
+            )}
+            {line.type === "multi" && (
+              <div style={{
+                color: "#dc2626", fontSize: "10px", fontWeight: "bold",
+                margin: "4px 0 2px 16px", letterSpacing: "0.03em"
+              }}>
+                ⚠ model ran {line.count} commands for one input — each is shown separately below; do NOT read them as a single result
               </div>
             )}
             {line.type === "ran" && (
